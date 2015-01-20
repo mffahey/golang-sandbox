@@ -1,9 +1,7 @@
 package main
 
 import (
-    "encoding/binary"
     "bytes"
-    "errors"
     "fmt"
     "log"
     "net"
@@ -12,11 +10,14 @@ import (
     "strings"
     "sync"
     "time"
+    
+    "github.com/mffahey/golang-sandbox/tftp/tftpconst"
+    "github.com/mffahey/golang-sandbox/tftp/debug"
+    "github.com/mffahey/golang-sandbox/tftp/packets"
 )
 
+
 const (
-    // local listener ip address (the port for the initial request listener)
-    laddr = ":69"
     // default packet read length in bytes. Must be long enough to accommodate the longest possible packet, since a UDP PacketConn may throw away any leftover bytes
     pLen = 2048
     blockSize = 512
@@ -25,32 +26,26 @@ const (
     timeoutDuration = 10000 * time.Millisecond
     // default retry count for un-acked packets 
     retry = 2
-    
-    // op code constants
-    opRrq uint16 = 1
-    opWrq uint16 = 2
-    opData uint16 = 3
-    opAck uint16 = 4
-    opErr uint16 = 5
-    
-    // error code constants
-    errNDef uint16 = 0
-    errFNF uint16 = 1
-    errAccess uint16 = 2
-    errDiskFull uint16 = 3
-    errIllegalOp uint16 = 4
-    errUnknownTID uint16 = 5
-    errFileExists uint16 = 6
-    
 )
 
 func timeout() time.Time {
     return time.Now().Add(timeoutDuration);
 }
 
-// FileSystem stuff. Intentionally creating out own file interface instead of using the os.File struct.
-// Out File itself implements ReaderWriter to access the underlying data
-//TODO: Refactor into its own package later
+/*
+ * Global vars for runtime configuration
+ */
+ 
+// Can we overwrite pre-existing files?
+var overwriteEnabled = true;
+
+// Lock on read?
+// If true, a write request will block until all read requests on a resource have fully completed, and vice versa, ensuring that all read requests concurrent read requests see the same view of the data.
+// If false, reads will be non blocking. Read requests will still return a self-consistent view of the file, but the data returned may be out of date by the time the client receives it.
+var lockFileForRead = true;
+
+
+// FileSystem stuff. Note that our FS is just a map, and out simplified in memory file does not implement os.File
 type InMemFS map[string]*InMemFile
 
 type InMemFile struct {
@@ -62,103 +57,27 @@ func (f *InMemFile) isFinished() bool {
     return f.data != nil
 }
 
-// sourcedPacket type and methods
-
-type sourcedPacket struct {
-    data []byte
-    src net.Addr
-}
-
-/*
- * Returns as a string the sender TFTP TID of this packet, i.e. the sender's port number
- */
-func (p *sourcedPacket) getTID() string {
-    _, port, err := net.SplitHostPort(p.src.String())
-    if err != nil {
-        debugln("getTid failed for packet with source", p.src, "Error was:", err)
-        return ""
-    }
-    return port
-}
-
 /* 
- * If this is a valid TFTP packet, return the opcode
- */
-func (p *sourcedPacket) getOpcode() (uint16, error) {
-    if len(p.data) < 2 {
-        return 0, errors.New("tftps: packet too short")
-    }
-    op := uint16(p.data[0])
-    op = op << (8)
-    op += uint16(p.data[1])
-    if op > 5 {
-        return 0, errors.New(fmt.Sprintf("tftps: invalid opcode %v", op))
-    }
-    return op, nil
-}
-
-/* 
- * If this is a valid RRQ/WRQ TFTP packet, return the request params for filename and transmission mode.
- * Other optional 0-separated params (e.g. tsize) may be present depedning on the client revision, but our server just ignores them.
- */
-func (p *sourcedPacket) getReqParams() (filename, tmode string, err error) {
-    if len(p.data) < 6 {
-        return "", "", errors.New("tftps: RRQ/WRQ packet too short.")
-    }
-    rparams := bytes.Split(p.data[2:], []byte{0})
-    if len(rparams) >= 2 {
-        filename = string(rparams[0])
-        tmode = string(rparams[1])
-    } else {
-        err = errors.New("tftps: RRQ/WRQ packet improperly formatted")
-    }
-    return
-}
-
-/* 
- * If this is a valid ACK/DATA TFTP packet, return the Block # 
- */
-func (p *sourcedPacket) getBlock() (uint16, error) {
-    if len(p.data) < 4 {
-        return 0, errors.New("tftps: ACK/DATA packet too short.")
-    }
-    block := uint16(p.data[2])
-    block = block << (8)
-    block += uint16(p.data[3])
-    return block, nil
-}
-
-/* 
- * If this is a valid DATA TFTP packet, return a byte slice corresponding to the data field
- */
-func (p *sourcedPacket) getData() ([]byte, error) {
-    if len(p.data) < 4 {
-        return nil, errors.New("tftps: DATA packet too short.")
-    }
-    return p.data[4:], nil
-}
-
-/* 
- * Function which listens for requests, initializes request handlers, and routes incoming packets
+ * Function which listens for requests and calls into request handlers 
  */
 func listen(fs *InMemFS, quit chan bool) error {
     fmt.Printf("listen() invoked \n")
     // Open a net.PacketConn. This will be the default request listener
-    conn , err := net.ListenPacket("udp", laddr)
+    conn , err := net.ListenPacket("udp", tftpconst.Laddr)
     if err != nil {
-        log.Fatalf("Unable to open connection on %v ; error was %v\n", laddr, err)
+        log.Fatalf("Unable to open connection on %v ; error was %v\n", tftpconst.Laddr, err)
     }
     defer conn.Close()
-    packets := make(chan *sourcedPacket)
+    packets := make(chan *packets.SourcedPacket)
     go listenPackets(&conn, packets)
     
-    fmt.Printf("Listening on %v...", laddr)
+    fmt.Printf("Listening on %v...", tftpconst.Laddr)
     // WaitGroup for tracking whether there are any outstanding requests
     var transWG sync.WaitGroup
     for {
         select {
             case p := <- packets :
-                debugln("listen: Packet popped was", string(p.data), "from", p.src);
+                debug.Debugln("listen: Packet popped was", string(p.Data), "from", p.Src);
                 transWG.Add(1)
                 go func() {
                     defer transWG.Done()
@@ -176,11 +95,10 @@ func listen(fs *InMemFS, quit chan bool) error {
 
 // Request handler functions
 
-
 /* 
  * Using the given PacketConn, continuously read incoming packets and push them into the provided channel
  */
-func listenPackets(conn *net.PacketConn, packets chan *sourcedPacket) {
+func listenPackets(conn *net.PacketConn, packetsChan chan *packets.SourcedPacket) {
     // Read with no timeout
     err := (*conn).SetReadDeadline(time.Time{})
     if err != nil {
@@ -192,16 +110,16 @@ func listenPackets(conn *net.PacketConn, packets chan *sourcedPacket) {
         if err != nil {
             log.Fatalf("Encountered error reading packet on primary connection %v ; error was %v\n", conn, err)
         }
-        debugln(n, " bytes read. Source address was ", src)
-        debugln("Content:", string(pContent[:n]))
-        packets <- &sourcedPacket{pContent[:n], src}
+        debug.Debugln(n, " bytes read. Source address was ", src)
+        debug.Debugln("Content:", string(pContent[:n]))
+        packetsChan <- &packets.SourcedPacket{pContent[:n], src}
     }
 }
 
 /*
  * Handles the scope of a single transaction, whether read, write, or other
  */
-func handleTransaction(p *sourcedPacket, fs *InMemFS) {
+func handleTransaction(p *packets.SourcedPacket, fs *InMemFS) {
     // Get new net.PacketConn for this transaction
     // ":0" to delegate un-socketed port assignment to the OS -- Attr. a hot tip from Justen Meden
     tConn , err := net.ListenPacket("udp", ":0")
@@ -214,48 +132,46 @@ func handleTransaction(p *sourcedPacket, fs *InMemFS) {
     defer tConn.Close()
     err = tConn.SetDeadline(timeout())
     if err != nil {
-        debugln("handleTransaction: Unable to set read timeout. Error was:", err);
-        writeErrorPacket(&tConn, p, errIllegalOp, err.Error())
+        packets.WriteErrorPacket(&tConn, p, tftpconst.ErrIllegalOp, err.Error(), timeout())
         return
     }
-    op, err := p.getOpcode()
+    op, err := p.Opcode()
     if err != nil {
-        debugln("handleTransaction: Invalid packet. Ignoring. Error was:", err);
-        writeErrorPacket(&tConn, p, errIllegalOp, err.Error())
+        packets.WriteErrorPacket(&tConn, p, tftpconst.ErrIllegalOp, err.Error(), timeout())
         return
     }
     switch op {
-        case opRrq:
-            debugln("handleTransaction: Handling RRQ request.");
+        case tftpconst.OpRrq:
+            debug.Debugln("handleTransaction: Handling RRQ request.");
             handleRead(&tConn, p, fs)
-        case opWrq: 
-            debugln("handleTransaction: Handling WRQ request.");
+        case tftpconst.OpWrq: 
+            debug.Debugln("handleTransaction: Handling WRQ request.");
             handleWrite(&tConn, p, fs)
         default: 
             errMsg := fmt.Sprintf("Opcode %v is invalid in this context.", op)
-            debugln("handleTransaction:", errMsg, "Sending ERROR response.")
-            writeErrorPacket(&tConn, p, errIllegalOp, errMsg)
+            debug.Debugln("handleTransaction:", errMsg, "Sending ERROR response.")
+            packets.WriteErrorPacket(&tConn, p, tftpconst.ErrIllegalOp, errMsg, timeout())
     }
 }
 
-func handleRead(conn *net.PacketConn, p *sourcedPacket, fs *InMemFS) {
-    filename, tmode, err := p.getReqParams()
+/*
+ * Handle control flow for read transaction type
+ */
+func handleRead(conn *net.PacketConn, p *packets.SourcedPacket, fs *InMemFS) {
+    filename, tmode, err := p.ReqParams()
     if err != nil {
-        debugln("handleRead: Invalid packet. Error was:", err)
-        writeErrorPacket(conn, p, errIllegalOp, err.Error())
+        packets.WriteErrorPacket(conn, p, tftpconst.ErrIllegalOp, err.Error(), timeout())
         return
     }
     if "octet" != strings.ToLower(tmode) {
         errMsg := fmt.Sprintf("Unsupported TFTP mode %v. Only octet mode is supported by this server.", tmode)
-        debugln("handleRead: ", errMsg)
-        writeErrorPacket(conn, p, errNDef, errMsg)
+        packets.WriteErrorPacket(conn, p, tftpconst.ErrNDef, errMsg, timeout())
         return
     }
     file, exists := (*fs)[filename] 
     if !exists || !file.isFinished() {
         errMsg := fmt.Sprintf("No file exists for filename: %v", filename)
-        debugln("handleRead: ", errMsg)
-        writeErrorPacket(conn, p, errNDef, errMsg)
+        packets.WriteErrorPacket(conn, p, tftpconst.ErrFNF, errMsg, timeout())
         return
     }
     if lockFileForRead {
@@ -272,59 +188,53 @@ func handleRead(conn *net.PacketConn, p *sourcedPacket, fs *InMemFS) {
     for pDataLen := blockSize; pDataLen == blockSize ; {
         n, err := fileDataBuf.Read(pData)
         if err != nil {
-            debugln("handleRead:", err)
-            writeErrorPacket(conn, prevPacketRec, errNDef, err.Error())
+            packets.WriteErrorPacket(conn, prevPacketRec, tftpconst.ErrNDef, err.Error(), timeout())
             return
         }
         pDataLen = n
-        for err = writeDataPacket(conn, prevPacketRec, block, pData[:pDataLen]); err != nil ; {
+        for err = packets.WriteDataPacket(conn, prevPacketRec, block, pData[:pDataLen], timeout()); err != nil ; {
             if retryCount < retry {
                 retryCount++
-                debugln("handleRead: Retrying packet send for block", block)
-                err = writeDataPacket(conn, prevPacketRec, block, pData[:pDataLen])
+                debug.Debugln("handleRead: Retrying packet send for block", block)
+                err = packets.WriteDataPacket(conn, prevPacketRec, block, pData[:pDataLen], timeout())
             } else {
-                debugln("handleRead: ", err)
-                writeErrorPacket(conn, prevPacketRec, errNDef, err.Error())
+                packets.WriteErrorPacket(conn, prevPacketRec, tftpconst.ErrNDef, err.Error(), timeout())
                 return 
             }
         }
         // Data packet sent. Wait for ack.
         pContent := make([]byte, pLen)
-        for ackReceived := false; ackReceived ; {
+        for ackReceived := false; !ackReceived ; {
             (*conn).SetDeadline(timeout())
             n, src ,err := (*conn).ReadFrom(pContent)
             if err != nil {
                 e, ok := err.(net.Error)
                 if ok && e.Timeout() == true && retryCount < retry {
                     retryCount++
-                    debugln("handleRead: timed out waiting for client. Retrying send for block", block)
-                    writeDataPacket(conn, prevPacketRec, block, pData[:pDataLen])
+                    debug.Debugln("handleRead: timed out waiting for client. Retrying send for block", block)
+                    packets.WriteDataPacket(conn, prevPacketRec, block, pData[:pDataLen], timeout())
                     continue
                 }
-                debugln("handleRead: ", err)
-                writeErrorPacket(conn, prevPacketRec, errNDef, err.Error())
+                packets.WriteErrorPacket(conn, prevPacketRec, tftpconst.ErrNDef, err.Error(), timeout())
                 return 
             }
-            packetRec := &sourcedPacket{pContent[:n], src}
+            packetRec := &packets.SourcedPacket{pContent[:n], src}
             // Check sender TID correctness
-            if (packetRec.getTID() != p.getTID()) {
+            if (packetRec.TID() != p.TID()) {
                 errMsg := fmt.Sprintf("Unrecognized sender TID %v", filename)
-                debugln("handleRead: ", errMsg)
-                writeErrorPacket(conn, packetRec, 5, errMsg)
+                packets.WriteErrorPacket(conn, packetRec, tftpconst.ErrUnknownTID, errMsg, timeout())
                 continue
             }
             // Check OpCode correctness
-            if op, _ := packetRec.getOpcode(); op != opAck {
+            if op, _ := packetRec.Opcode(); op != tftpconst.OpAck {
                 errMsg := fmt.Sprintf("Opcode %v is invalid in this context.", op)
-                debugln("handleRead:", errMsg)
-                writeErrorPacket(conn, packetRec, errIllegalOp, errMsg)
+                packets.WriteErrorPacket(conn, packetRec, tftpconst.ErrIllegalOp, errMsg, timeout())
                 return
             } 
             // CHeck Block correctness (duplicate or next block)
-            pBlock, err := packetRec.getBlock()
+            pBlock, err := packetRec.Block()
             if err != nil {
-                debugln("handleRead:", err)
-                writeErrorPacket(conn, packetRec, errNDef, err.Error())
+                packets.WriteErrorPacket(conn, packetRec, tftpconst.ErrNDef, err.Error(), timeout())
                 return
             }
             if pBlock < block {
@@ -332,8 +242,7 @@ func handleRead(conn *net.PacketConn, p *sourcedPacket, fs *InMemFS) {
                 continue;
             } else if pBlock != block {
                 errMsg := fmt.Sprintf("Unexpected block # %v; was expecting %v", pBlock, block)
-                debugln("handleRead:", errMsg)
-                writeErrorPacket(conn, packetRec, errNDef, errMsg)
+                packets.WriteErrorPacket(conn, packetRec, tftpconst.ErrNDef, errMsg, timeout())
                 return
             }
             
@@ -343,21 +252,22 @@ func handleRead(conn *net.PacketConn, p *sourcedPacket, fs *InMemFS) {
         block++
         retryCount = 0
     }
-    debugln("handleRead: complete read transaction for file", filename)
+    debug.Debugln("handleRead: complete read transaction for file", filename)
     return
 }
 
-func handleWrite(conn *net.PacketConn, p *sourcedPacket, fs *InMemFS) {
-    filename, tmode, err := p.getReqParams()
+/*
+ * Handle control flow for write transaction type
+ */
+func handleWrite(conn *net.PacketConn, p *packets.SourcedPacket, fs *InMemFS) {
+    filename, tmode, err := p.ReqParams()
     if err != nil {
-        debugln("handleWrite: Invalid packet. Error was:", err)
-        writeErrorPacket(conn, p, errIllegalOp, err.Error())
+        packets.WriteErrorPacket(conn, p, tftpconst.ErrIllegalOp, err.Error(), timeout())
         return
     }
     if "octet" != strings.ToLower(tmode) {
         errMsg := fmt.Sprintf("Unsupported TFTP mode %v. Only octet mode is supported by this server.", tmode)
-        debugln("handleWrite: ", errMsg)
-        writeErrorPacket(conn, p, errNDef, errMsg)
+        packets.WriteErrorPacket(conn, p, tftpconst.ErrNDef, errMsg, timeout())
         return
     }
     file, exists := (*fs)[filename] 
@@ -366,8 +276,7 @@ func handleWrite(conn *net.PacketConn, p *sourcedPacket, fs *InMemFS) {
         defer file.lock.Unlock()
         if !overwriteEnabled && file.isFinished() {
             errMsg := fmt.Sprintf("A file already exists for filename: %v", filename)
-            debugln("handleWrite: ", errMsg)
-            writeErrorPacket(conn, p, errFileExists, errMsg)
+            packets.WriteErrorPacket(conn, p, tftpconst.ErrFileExists, errMsg, timeout())
             return
         }
     } else {
@@ -387,54 +296,48 @@ func handleWrite(conn *net.PacketConn, p *sourcedPacket, fs *InMemFS) {
     retryCount := 0
     
     // Write the first Ack. This block occurs a few times below and could probably be factored into a separate func
-    for err:= writeAckPacket(conn, prevPacketRec, block); err != nil ; {
+    for err:= packets.WriteAckPacket(conn, prevPacketRec, block, timeout()); err != nil ; {
         if retryCount < retry {
             retryCount++
-            debugln("handleWrite: Retrying packet send for block", block)
-            err = writeAckPacket(conn, prevPacketRec, block)
+            debug.Debugln("handleWrite: Retrying packet send for block", block)
+            err = packets.WriteAckPacket(conn, prevPacketRec, block, timeout())
         } else {
-            debugln("handleWrite: ", err)
-            writeErrorPacket(conn, prevPacketRec, errNDef, err.Error())
+            packets.WriteErrorPacket(conn, prevPacketRec, tftpconst.ErrNDef, err.Error(), timeout())
             return 
         }
     }
     
     for prevBytesWritten := blockSize; prevBytesWritten == blockSize ; {
-        debugln("TODO remove loopin...")
         (*conn).SetDeadline(timeout())
         n, src ,err := (*conn).ReadFrom(pContent)
         if err != nil {
             e, ok := err.(net.Error)
             if ok && e.Timeout() == true && retryCount < retry {
                 retryCount++
-                debugln("handleWrite: timed out waiting for client. Retrying send for block", block)
-                writeAckPacket(conn, prevPacketRec, block)
+                debug.Debugln("handleWrite: timed out waiting for client. Retrying send for block", block)
+                packets.WriteAckPacket(conn, prevPacketRec, block, timeout())
                 continue
             }
-            debugln("handleWrite: ", err)
-            writeErrorPacket(conn, p, errNDef, err.Error())
+            packets.WriteErrorPacket(conn, p, tftpconst.ErrNDef, err.Error(), timeout())
             return 
         }
-        packetRec := &sourcedPacket{pContent[:n], src}
+        packetRec := &packets.SourcedPacket{pContent[:n], src}
         // Check sender TID correctness
-        if (packetRec.getTID() != p.getTID()) {
+        if (packetRec.TID() != p.TID()) {
             errMsg := fmt.Sprintf("Unrecognized sender TID %v", filename)
-            debugln("handleWrite: ", errMsg)
-            writeErrorPacket(conn, packetRec, 5, errMsg)
+            packets.WriteErrorPacket(conn, packetRec, tftpconst.ErrUnknownTID, errMsg, timeout())
             continue
         }
         // Check OpCode correctness
-        if op, _ := packetRec.getOpcode(); op != opData {
+        if op, _ := packetRec.Opcode(); op != tftpconst.OpData {
             errMsg := fmt.Sprintf("Opcode %v is invalid in this context.", op)
-            debugln("handleWrite:", errMsg)
-            writeErrorPacket(conn, packetRec, errIllegalOp, errMsg)
+            packets.WriteErrorPacket(conn, packetRec, tftpconst.ErrIllegalOp, errMsg, timeout())
             return
         } 
         // CHeck Block correctness (duplicate or next block)
-        pBlock, err := packetRec.getBlock()
+        pBlock, err := packetRec.Block()
         if err != nil {
-            debugln("handleWrite:", err)
-            writeErrorPacket(conn, packetRec, errNDef, err.Error())
+            packets.WriteErrorPacket(conn, packetRec, tftpconst.ErrNDef, err.Error(), timeout())
             return
         }
         if pBlock < block {
@@ -443,14 +346,13 @@ func handleWrite(conn *net.PacketConn, p *sourcedPacket, fs *InMemFS) {
         }
         if pBlock == block {
             // don't reset retryCount before responding to duplicates 
-            for err:= writeAckPacket(conn, packetRec, block); err != nil ; {
+            for err:= packets.WriteAckPacket(conn, packetRec, block, timeout()); err != nil ; {
                 if retryCount < retry {
                     retryCount++
-                    debugln("handleWrite: Retrying packet send for block", block)
-                    err = writeAckPacket(conn, packetRec, block)
+                    debug.Debugln("handleWrite: Retrying packet send for block", block)
+                    err = packets.WriteAckPacket(conn, packetRec, block, timeout())
                 } else {
-                    debugln("handleWrite: ", err)
-                    writeErrorPacket(conn, packetRec, errNDef, err.Error())
+                    packets.WriteErrorPacket(conn, packetRec, tftpconst.ErrNDef, err.Error(), timeout())
                     return 
                 }
             }
@@ -459,130 +361,31 @@ func handleWrite(conn *net.PacketConn, p *sourcedPacket, fs *InMemFS) {
         block++
         if pBlock != block {
             errMsg := fmt.Sprintf("Unexpected block # %v; was expecting %v", pBlock, block)
-            debugln("handleWrite:", errMsg)
-            writeErrorPacket(conn, packetRec, errNDef, errMsg)
+            packets.WriteErrorPacket(conn, packetRec, tftpconst.ErrNDef, errMsg, timeout())
             return
         }
-        pdata, _ := packetRec.getData()
+        pdata, _ := packetRec.ContentData()
         bytesWritten, _ := newFileDataBuf.Write(pdata)
         prevBytesWritten = bytesWritten
         prevPacketRec = packetRec
         retryCount = 0
-        for err:= writeAckPacket(conn, packetRec, block); err != nil ; {
+        for err:= packets.WriteAckPacket(conn, packetRec, block, timeout()); err != nil ; {
             if retryCount < retry {
                 retryCount++
-                debugln("handleWrite: Retrying packet send for block", block)
-                err = writeAckPacket(conn, packetRec, block)
+                debug.Debugln("handleWrite: Retrying packet send for block", block)
+                err = packets.WriteAckPacket(conn, packetRec, block, timeout())
             } else {
-                debugln("handleWrite: ", err)
-                writeErrorPacket(conn, packetRec, errNDef, err.Error())
+                packets.WriteErrorPacket(conn, packetRec, tftpconst.ErrNDef, err.Error(), timeout())
                 return 
             }
         }
     }
-    debugln("handleWrite: Data transfer complete. Updating file data")
+    debug.Debugln("handleWrite: Data transfer complete. Updating file data")
     file.data = newFileDataBuf.Bytes()
     // TODO: listen a little longer to make sure the client doesn't need us to re-ACK the last DATA packet
     return
 }
 
-// Packet Sending Functions
-
-/* 
- * Use the given conn to send an Data packet in response to packet sp (based on sender address)
- */ 
-func writeDataPacket(conn *net.PacketConn, p *sourcedPacket, block uint16, data []byte) error {
-    var b bytes.Buffer
-    if err := binary.Write(&b, binary.BigEndian, opData); err != nil {
-        debugln("writeDataPacket: Error writing opcode into packet buffer. Error was ", err);
-        return err
-    }
-    if err := binary.Write(&b, binary.BigEndian, block); err != nil {
-        debugln("writeDataPacket: Error writing block into packet buffer. Error was ", err);
-        return err
-    }
-    b.Write([]byte(data))
-    content := (&b).Bytes()
-    debugln("writeDataPacket: content is", string(content));
-    (*conn).SetDeadline(timeout())
-    if _, err := (*conn).WriteTo(content, p.src); err != nil {
-        debugln("writeDataPacket: Error sending packet. Error was ", err);
-        return err
-    }
-    return nil
-}
-
-/* 
- * Use the given conn to send an Ack packet in response to packet sp (based on sender address)
- */ 
-func writeAckPacket(conn *net.PacketConn, p *sourcedPacket,  block uint16) error {
-    var b bytes.Buffer
-    if err := binary.Write(&b, binary.BigEndian, opAck); err != nil {
-        debugln("writeAckPacket: Error writing opcode into packet buffer. Error was ", err);
-        return err
-    }
-    if err := binary.Write(&b, binary.BigEndian, block); err != nil {
-        debugln("writeAckPacket: Error writing block into packet buffer. Error was ", err);
-        return err
-    }
-    content := (&b).Bytes()
-    debugln("writeAckPacket: content is", string(content));
-    (*conn).SetDeadline(timeout())
-    if _, err := (*conn).WriteTo(content, p.src); err != nil {
-        debugln("writeAckPacket: Error sending packet. Error was ", err);
-        return err
-    }
-    return nil
-}
-
-/* 
- * Use the given conn to send an Error packet in response to packet sp (based on sender address)
- */ 
-func writeErrorPacket(conn *net.PacketConn, p *sourcedPacket, errCode uint16, errMsg string ) error {
-    var b bytes.Buffer
-    if err := binary.Write(&b, binary.BigEndian, opErr); err != nil {
-        debugln("writeErrorPacket: Error writing opcode into packet buffer. Error was ", err);
-        return err
-    }
-    if err := binary.Write(&b, binary.BigEndian, errCode); err != nil {
-        debugln("writeErrorPacket: Error writing opcode into packet buffer. Error was ", err);
-        return err
-    }
-    b.Write([]byte(errMsg))
-    b.WriteByte(byte(0))
-    content := (&b).Bytes()
-    debugln("writeErrorPacket: content is", string(content));
-    (*conn).SetDeadline(timeout())
-    if _, err := (*conn).WriteTo(content, p.src); err != nil {
-        debugln("writeErrorPacket: Error sending packet. Error was ", err);
-        return err
-    }
-    return nil
-}
-
-/*
- * Global vars for runtime configuration
- */
- 
-// Can we overwrite pre-existing files?
-// TODO: add support for setting this via command line
-var overwriteEnabled = false;
-// Lock on read?
-// If true, a write request will block until all read requests on a resource have fully completed, and vice versa, ensuring that all read requests concurrent read requests see the same view of the data.
-// If false, reads will be non blocking. Read requests will still return a self-consistent view of the file, but the data returned may be out of date by the time the client receives it.
-// TODO: add support for setting this via command line
-var lockFileForRead = true;
- 
-// Lightweight debug logging support
-var debug = false;
-
-func debugln(a ...interface{}) (n int, err error) {
-    if debug {
-        return fmt.Println(a)
-    } else {
-        return 0, nil
-    }
-}
 
 /* 
  * main function performs some initialization tasks and then waits on console input
@@ -594,12 +397,23 @@ func main() {
     default:
         fmt.Printf("This application has not yet been tested on OS %s. You have been warned.\n", opsys)
     }
-    // Only supported arg is "d" for debug/verbose mode
+    // Handle args
     args := os.Args[1:]
-    if len(args) > 0 && args[0] == "d" {
-        debug = true
-        debugln("Debug output is on.")
+    for _, arg := range args {
+        switch(arg) {
+            case "d":
+                fallthrough
+            case "-d":
+                debug.Debug = true
+                debug.Debugln("debug.Debug output is on.")
+            case "--disableOverwrite":
+                overwriteEnabled = false
+            case "--disableLockOnRead":
+                lockFileForRead = false
+        }
     }
+    debug.Debugln("overwriteEnabled =", overwriteEnabled, "; lockFileForRead =", lockFileForRead)
+    
     fmt.Printf("Starting TFTP server...\n")
     // Initialize in-memory file system
     fs := make(InMemFS)
@@ -617,14 +431,14 @@ func main() {
             // handle input
             switch input {
                 case "d":
-                    debug = !debug
-                    fmt.Println("Set debug mode: ", debug)
+                    debug.Debug = !debug.Debug
+                    fmt.Println("Set debug.Debug mode: ", debug.Debug)
                 case "ls":
                     fmt.Println(fs)
                 case "shutdown":
                     quit <- true
                 default:
-                    debugln("Unrecognized console input",input)
+                    debug.Debugln("Unrecognized console input",input)
             }
         } else {
             fmt.Println("Error reading console input: ", inputErr)
